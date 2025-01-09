@@ -1,81 +1,97 @@
 # -*- coding: utf-8 -*-
+#(не убирать сверху)
 import json
 import numpy as np
-from flask import Flask, request, jsonify
-import cv2
+from flask import Flask, request
 import tensorflow as tf
-from keras import layers, ops
-import os
+import keras
+from keras import layers
+from math import sqrt
+import cv2
 
 app = Flask(__name__)
 
+IMG_WIDTH = 200
+IMG_HEIGHT = 50
 
-def compute_ctc_loss(true_labels, predicted_logits, seq_lengths, label_lengths):
-    label_lengths = ops.cast(ops.squeeze(label_lengths, axis=-1), dtype="int32")
-    seq_lengths = ops.cast(ops.squeeze(seq_lengths, axis=-1), dtype="int32")
 
-    sparse_labels = ops.cast(
-        dense_to_sparse_labels(true_labels, label_lengths), dtype="int32"
-    )
+def ctc_label_dense_to_sparse(labels, label_lengths):
+    label_shape = tf.shape(labels)
+    num_batches_tns = tf.stack([label_shape[0]])
+    max_num_labels_tns = tf.stack([label_shape[1]])
 
-    predicted_logits = ops.log(
-        ops.transpose(predicted_logits, [1, 0, 2]) + tf.keras.backend.epsilon()
-    )
+    def range_less_than(old_input, current_input):
+        return tf.expand_dims(tf.range(tf.shape(old_input)[1]), 0) < tf.fill(
+            max_num_labels_tns, current_input
+        )
 
-    return ops.expand_dims(
-        tf.compat.v1.nn.ctc_loss(
-            inputs=predicted_logits,
-            labels=sparse_labels,
-            sequence_length=seq_lengths,
-        ),
-        axis=1,
-    )
-
-def dense_to_sparse_labels(labels, label_lengths):
-    label_shape = ops.shape(labels)
-    max_labels = ops.stack([label_shape[1]])
-
-    def range_check(_, current_length):
-        return ops.expand_dims(
-            ops.arange(ops.shape(_)[1]), axis=0
-        ) < tf.fill(max_labels, current_length)
-
+    init = tf.cast(tf.fill([1, label_shape[1]], 0), dtype="bool")
     dense_mask = tf.compat.v1.scan(
-        range_check, label_lengths, initializer=tf.zeros([1, label_shape[1]], dtype="bool")
-    )[:, 0, :]
+        range_less_than, label_lengths, initializer=init, parallel_iterations=1
+    )
+    dense_mask = dense_mask[:, 0, :]
 
-    indices = tf.compat.v1.where(dense_mask)
-    values = tf.compat.v1.gather_nd(labels, indices)
+    label_array = tf.reshape(
+        tf.tile(tf.range(0, label_shape[1]), [label_shape[0]]), label_shape
+    )
+    label_ind = tf.compat.v1.boolean_mask(label_array, dense_mask)
+
+    batch_array = tf.transpose(
+        tf.reshape(
+            tf.tile(tf.range(0, label_shape[0]), [label_shape[1]]),
+            tf.reverse(label_shape, [0]),
+        )
+    )
+    batch_ind = tf.compat.v1.boolean_mask(batch_array, dense_mask)
+    indices = tf.transpose(
+        tf.reshape(tf.concat([batch_ind, label_ind], axis=0), [2, -1])
+    )
+
+    vals_sparse = tf.compat.v1.gather_nd(labels, indices)
 
     return tf.SparseTensor(
-        indices=ops.cast(indices, dtype="int64"),
-        values=values,
-        dense_shape=ops.cast(label_shape, dtype="int64"),
+        tf.cast(indices, dtype="int64"),
+        vals_sparse,
+        tf.cast(label_shape, dtype="int64")
     )
 
+def ctc_batch_cost(y_true, y_pred, input_length, label_length):
+    label_length = tf.cast(tf.squeeze(label_length, axis=-1), dtype="int32")
+    input_length = tf.cast(tf.squeeze(input_length, axis=-1), dtype="int32")
+    sparse_labels = tf.cast(ctc_label_dense_to_sparse(y_true, label_length), dtype="int32")
 
-class CTCComputationLayer(layers.Layer):
+    y_pred = tf.math.log(tf.transpose(y_pred, perm=[1, 0, 2]) + keras.backend.epsilon())
+
+    return tf.expand_dims(
+        tf.compat.v1.nn.ctc_loss(
+            inputs=y_pred, labels=sparse_labels, sequence_length=input_length
+        ),
+        1,
+    )
+
+class CTCLayer(layers.Layer):
     def __init__(self, name=None, **kwargs):
         super().__init__(name=name, **kwargs)
-        self.loss_function = compute_ctc_loss
+        self.loss_fn = ctc_batch_cost
 
-    def call(self, true_labels, predicted_logits):
-        batch_size = ops.cast(ops.shape(true_labels)[0], dtype="int64")
-        input_length = ops.cast(ops.shape(predicted_logits)[1], dtype="int64")
-        label_length = ops.cast(ops.shape(true_labels)[1], dtype="int64")
+    def call(self, y_true, y_pred):
+        batch_len = tf.cast(tf.shape(y_true)[0], dtype="int64")
+        input_length = tf.cast(tf.shape(y_pred)[1], dtype="int64")
+        label_length = tf.cast(tf.shape(y_true)[1], dtype="int64")
 
-        input_lengths = input_length * ops.ones((batch_size, 1), dtype="int64")
-        label_lengths = label_length * ops.ones((batch_size, 1), dtype="int64")
+        input_length = input_length * tf.ones(shape=(batch_len, 1), dtype="int64")
+        label_length = label_length * tf.ones(shape=(batch_len, 1), dtype="int64")
 
-        loss = self.loss_function(true_labels, predicted_logits, input_lengths, label_lengths)
+        loss = self.loss_fn(y_true, y_pred, input_length, label_length)
         self.add_loss(loss)
-        return predicted_logits
+
+        return y_pred
 
 def ctc_decode(y_pred, input_length, greedy=True, beam_width=100, top_paths=1):
-    input_shape = ops.shape(y_pred)
+    input_shape = tf.shape(y_pred)
     num_samples, num_steps = input_shape[0], input_shape[1]
-    y_pred = ops.log(ops.transpose(y_pred, axes=[1, 0, 2]) + keras.backend.epsilon())
-    input_length = ops.cast(input_length, dtype="int32")
+    y_pred = tf.math.log(tf.transpose(y_pred, perm=[1, 0, 2]) + keras.backend.epsilon())
+    input_length = tf.cast(input_length, dtype="int32")
 
     if greedy:
         (decoded, log_prob) = tf.nn.ctc_greedy_decoder(
@@ -94,104 +110,62 @@ def ctc_decode(y_pred, input_length, greedy=True, beam_width=100, top_paths=1):
         decoded_dense.append(tf.sparse.to_dense(sp_input=st, default_value=-1))
     return decoded_dense, log_prob
 
-
-# A utility function to decode the output of the network
 def decode_batch_predictions(pred):
     input_len = np.ones(pred.shape[0]) * pred.shape[1]
-    # Use greedy search. For complex tasks, you can use beam search
-    results = ctc_decode(pred, input_length=input_len, greedy=True)[0][0][
-        :, :5
-    ]
-    # Iterate over the results and get back the text
+    results = ctc_decode(pred, input_length=input_len, greedy=True)[0][0][:, :5]
     output_text = []
     for res in results:
         res = tf.strings.reduce_join(num_to_char(res)).numpy().decode("utf-8")
         output_text.append(res)
     return output_text
 
-
 def encode_single_sample(img_path):
-    # 1. Read image
     img = tf.io.read_file(img_path)
-    # 2. Decode and convert to grayscale
     img = tf.io.decode_png(img, channels=1)
-    # 3. Convert to float32 in [0, 1] range
     img = tf.image.convert_image_dtype(img, tf.float32)
-    # 4. Resize to the desired size
-    img = ops.image.resize(img, [img_height, img_width])
-    # 5. Transpose the image because we want the time
-    # dimension to correspond to the width of the image.
-    img = ops.transpose(img, axes=[1, 0, 2])
+    img = tf.image.resize(img, [IMG_HEIGHT, IMG_WIDTH])
+    img = tf.transpose(img, perm=[1, 0, 2])
     return img
-
 
 def color_distance(color1, color2):
     return sqrt(sum((color1[i] - color2[i])**2 for i in range(3)))
 
+def preprocess_image(img_path):
+    image = cv2.imread(img_path)
+    for y in range(image.shape[1]):
+        for x in range(image.shape[0]):
+            if color_distance(image[x, y], [153, 102, 0]) >= 90:
+                image[x, y] = [255, 255, 255]
+    cv2.imwrite(img_path, image)
 
-
-
-# def preprocess_image(img_path):
-#     image = cv2.imread(img_path)
-#     for y in range(image.shape[1]):
-#         for x in range(image.shape[0]):
-#             if np.linalg.norm(image[x, y] - np.array([153, 102, 0])) >= 90:
-#                 image[x, y] = [255, 255, 255]
-#     cv2.imwrite(img_path, image)
-
-
-# def prepare_sample(image_path):
-#     img = tf.io.read_file(image_path)
-#     img = tf.io.decode_png(img, channels=1)
-#     img = tf.image.resize(img, [IMG_HEIGHT, IMG_WIDTH])
-#     img = ops.transpose(img, [1, 0, 2])
-#     return img
-
-@app.route('/process-captcha', methods=['POST'])
-def process_captcha():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part in the request"}), 400
-
+# Основной обработчик запроса
+@app.route('/captcha', methods=["POST"])
+def handle_captcha():
+    filename = "input_image.png"
     uploaded_file = request.files['file']
-    temp_path = "temp_image.png"
-    uploaded_file.save(temp_path)
+    
+    if uploaded_file.filename != "":
+        uploaded_file.save(filename)
 
-    preprocess_image(temp_path)
-    reshaped_image = prepare_sample(temp_path)
+    preprocess_image(filename)
+    prediction = prediction_model.predict([tf.reshape(encode_single_sample(filename), [1, IMG_WIDTH, IMG_HEIGHT, 1])])
+    prediction_texts = decode_batch_predictions(prediction)
+    return prediction_texts[0]
 
-    prediction = prediction_model.predict(
-        tf.reshape(reshaped_image, [1, IMG_WIDTH, IMG_HEIGHT, 1])
-    )
-    predicted_text = decode_batch_predictions(prediction)  # Исправлено
-    os.remove(temp_path) 
-    return jsonify({"result": predicted_text})
+model = keras.models.load_model("captchamodel.h5", custom_objects={'CTCLayer': CTCLayer})
+prediction_model = keras.models.Model(model.input[0], model.get_layer(name="dense2").output)
 
+with open("char_to_num.json") as f:
+    char_to_num_config = json.load(f)
 
-IMG_WIDTH = 200
-IMG_HEIGHT = 50
+with open("num_to_char.json") as f:
+    num_to_char_config = json.load(f)
 
+char_to_num = layers.StringLookup.from_config(char_to_num_config)
+num_to_char = layers.StringLookup.from_config(num_to_char_config)
 
-try:
-    model = tf.keras.models.load_model(
-    "captchamodel.h5",
-    custom_objects={'CTCLayer': CTCComputationLayer}
-)
-    prediction_model = tf.keras.models.Model(
-        model.input[0], model.get_layer(name="dense2").output
-    )
-except Exception as e:
-    raise RuntimeError(f"Failed to load the model: {e}")
-
-try:
-    with open("char_to_num.json", "r") as f:
-        char_to_num_mapping = json.load(f)
-    with open("num_to_char.json", "r") as f:
-        num_to_char_mapping = json.load(f)
-
-    char_to_num = layers.StringLookup.from_config(char_to_num_mapping)
-    num_to_char = layers.StringLookup.from_config(num_to_char_mapping)
-except Exception as e:
-    raise RuntimeError(f"Failed to load character mappings: {e}")
-
+# Запуск Flask сервера
 if __name__ == "__main__":
-    app.run(debug=False)
+    app.run()
+
+
